@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# pre-push hook — scans commits about to be pushed for secrets, BEFORE they
+# reach the remote. Installed once per developer machine via
+# `git config --global init.templateDir`, so every future `git clone` or
+# `git init` gets this automatically — no per-repo setup step required.
+#
+# Git calls this hook as: pre-push <remote-name> <remote-url>
+# and feeds it lines on stdin: <local ref> <local sha> <remote ref> <remote sha>
+
+set -uo pipefail
+
+ZERO_SHA="0000000000000000000000000000000000000000"
+
+# Documented, logged emergency bypass. Not silent — anyone using this should
+# have a reason, and it's visible in their terminal output when they do.
+if [ "${SKIP_GITLEAKS_PUSH_CHECK:-}" = "1" ]; then
+  echo "⚠️  SKIP_GITLEAKS_PUSH_CHECK=1 set — skipping pre-push secret scan." >&2
+  echo "   This bypass should be rare. The CI Gitleaks check will still run on the PR." >&2
+  exit 0
+fi
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "❌ gitleaks is not installed — cannot scan before push." >&2
+  echo "   Install it: brew install gitleaks   (https://github.com/gitleaks/gitleaks#installing)" >&2
+  echo "   Emergency bypass (logged, use sparingly): SKIP_GITLEAKS_PUSH_CHECK=1 git push" >&2
+  exit 1
+fi
+
+FAILED=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+
+  # Deleting a remote branch — nothing being pushed to scan.
+  if [ "$local_sha" = "$ZERO_SHA" ]; then
+    continue
+  fi
+
+  if [ "$remote_sha" = "$ZERO_SHA" ]; then
+    # First push of a brand-new branch/tag. Scan everything reachable from
+    # this commit that isn't already on some remote-tracking branch, so we
+    # scan only what's actually new — not the entire repo history every time.
+    LOG_OPTS="${local_sha} --not --remotes"
+  else
+    # Normal push: scan exactly the commits being added.
+    LOG_OPTS="${remote_sha}..${local_sha}"
+  fi
+
+  CONFIG_ARG=()
+  if [ -f ".gitleaks.toml" ]; then
+    CONFIG_ARG=(--config .gitleaks.toml)
+  fi
+
+  echo "🔍 gitleaks: scanning '${local_ref}' before push..."
+
+  if ! gitleaks detect \
+      --source . \
+      "${CONFIG_ARG[@]}" \
+      --log-opts="${LOG_OPTS}" \
+      --redact \
+      --no-banner \
+      --exit-code 1; then
+    echo "" >&2
+    echo "🚫 Push blocked: possible secret found in commit(s) on '${local_ref}'." >&2
+    echo "   1. Rotate the credential if it's real." >&2
+    echo "   2. Remove it from history (amend the commit or rebase) before pushing again." >&2
+    echo "   3. If this is a false positive, add it to .gitleaks.toml's [allowlist] in a" >&2
+    echo "      separate, reviewed commit — don't bypass this check silently." >&2
+    FAILED=1
+  fi
+
+done
+
+exit "$FAILED"
