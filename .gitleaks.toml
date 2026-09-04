@@ -1,0 +1,34 @@
+title = "org-secret-scan-config"
+
+# Start from gitleaks' built-in default ruleset (AWS keys, GCP keys, private
+# keys, Slack/Stripe/Twilio tokens, generic high-entropy strings, etc.)
+[extend]
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Allowlist: add entries here as you triage false positives from Step 2/5.
+# Keep this list reviewed — don't let it become a place secrets hide.
+# ---------------------------------------------------------------------------
+[allowlist]
+description = "Global allowlist"
+paths = [
+  '''(.*?)(jpg|gif|doc|pdf|bin|svg|socket)$''',
+  '''(.*?)/vendor/(.*)''',
+  '''(.*?)/node_modules/(.*)''',
+  '''(.*?)/dist/(.*)''',
+]
+
+# Example of allowlisting a specific confirmed-false-positive commit/finding:
+# regexes = [
+#   '''example-fake-key-used-in-unit-tests''',
+# ]
+
+# ---------------------------------------------------------------------------
+# Add custom rules here for internal/proprietary token formats GitHub's and
+# Gitleaks' default detectors won't know about, e.g.:
+# ---------------------------------------------------------------------------
+# [[rules]]
+# id = "internal-api-token"
+# description = "Internal service API token"
+# regex = '''internal_[a-zA-Z0-9]{32}'''
+# tags = ["internal", "api-key"]

@@ -1,0 +1,127 @@
+name: trufflehog-scheduled-scan
+
+# Non-blocking safety net: runs on a schedule against the default branch's
+# full history, independent of PRs. Does NOT gate merges — Gitleaks (in
+# gitleaks-scan.yml) already does that. This workflow's job is to periodically
+# re-verify for live, exploitable secrets and alert a human.
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # weekly, Monday 03:00 UTC. For nightly, use: "0 3 * * *"
+  workflow_dispatch: {}    # allows manual "Run workflow" trigger from the Actions tab
+
+permissions:
+  contents: read
+  issues: write            # needed to open/update the tracking issue
+
+jobs:
+  trufflehog-scan:
+    name: trufflehog-verified-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install TruffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: Run TruffleHog (verified secrets only)
+        id: scan
+        run: |
+          trufflehog git file://. --only-verified --json > findings.json 2>trufflehog.log || true
+          COUNT=$(wc -l < findings.json | tr -d ' ')
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "Found $COUNT verified live secret(s)."
+          cat findings.json
+
+      - name: Build human-readable summary
+        if: steps.scan.outputs.count != '0'
+        id: summary
+        run: |
+          {
+            echo "body<<EOF"
+            echo "TruffleHog's weekly scan found **${{ steps.scan.outputs.count }}** verified, currently-live secret(s) in this repository's git history."
+            echo ""
+            echo "| Detector | File | Commit | Email |"
+            echo "|---|---|---|---|"
+            jq -r '[
+              (.DetectorName // "N/A"),
+              (.SourceMetadata.Data.Git.file // "N/A"),
+              (.SourceMetadata.Data.Git.commit // "N/A")[0:8],
+              (.SourceMetadata.Data.Git.email // "N/A")
+            ] | "| \(.[0]) | \(.[1]) | \(.[2]) | \(.[3]) |"' findings.json
+            echo ""
+            echo "**Action required:** rotate the credential at its source immediately, then decide whether to rewrite git history. Do not rely on this issue alone as a fix — treat as an active incident."
+            echo ""
+            echo "_Full findings (masked/unmasked per your TruffleHog output settings) are in this run's workflow logs and artifact — do not paste raw secrets into this issue._"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload findings as artifact (not posted publicly)
+        if: steps.scan.outputs.count != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: trufflehog-findings-${{ github.run_id }}
+          path: findings.json
+          retention-days: 30
+
+      - name: Open or update tracking issue
+        if: steps.scan.outputs.count != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `${{ steps.summary.outputs.body }}`;
+            const label = "secret-scan-alert";
+
+            // avoid opening a duplicate issue every week — update the existing one if open
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              labels: label,
+            });
+
+            if (existing.data.length > 0) {
+              const issue = existing.data[0];
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: `Re-detected on ${new Date().toISOString()}:\n\n${body}`,
+              });
+            } else {
+              try {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: label,
+                  color: "b60205",
+                  description: "Verified live secret found by scheduled TruffleHog scan",
+                });
+              } catch (e) { /* label likely already exists, ignore */ }
+
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `Verified live secret(s) detected — ${new Date().toISOString().slice(0,10)}`,
+                body: body,
+                labels: [label],
+              });
+            }
+
+      - name: Notify Slack
+        if: steps.scan.outputs.count != '0'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -z "${SLACK_WEBHOOK_URL:-}" ]; then
+            echo "SLACK_WEBHOOK_URL secret not set — skipping Slack notification. Add it in repo Settings > Secrets to enable."
+            exit 0
+          fi
+          curl -sX POST -H 'Content-type: application/json' \
+            --data "{\"text\": \"🚨 *${{ steps.scan.outputs.count }} verified live secret(s)* found in \`${{ github.repository }}\` by the weekly TruffleHog scan. See: ${{ github.server_url }}/${{ github.repository }}/issues\"}" \
+            "$SLACK_WEBHOOK_URL"
